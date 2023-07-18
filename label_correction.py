@@ -1,12 +1,17 @@
+from sklearn.linear_model import LogisticRegression
+import pandas as pd
 from abc import ABC, abstractmethod
-import pandas as pd
-import pandas as pd
 from sklearn.ensemble import BaggingClassifier
+import mlflow
 import numpy as np
 
+CLASSIFIERS = {
+    'LogReg': LogisticRegression
+}
+
 class LabelCorrectionModel(ABC):
-    def __init__(self, name):
-        self.name = name
+    def __init__(self) -> None:
+        pass
 
     @abstractmethod
     def correct(self, X:pd.DataFrame, y:pd.Series) -> pd.Series:
@@ -27,6 +32,10 @@ class LabelCorrectionModel(ABC):
         """
         pass
 
+    @abstractmethod
+    def log_params(self):
+        pass
+
 class OrderingBasedCorrection(LabelCorrectionModel):
     """
     Ordering-Based Correction algorithm
@@ -36,11 +45,10 @@ class OrderingBasedCorrection(LabelCorrectionModel):
 
     Attributes
     ----------
-    m : float
-        Proportion of labels to correct
+    threshold : float
+        Threshold for the margin of the ensemble classifier
     """
     def __init__(self, m):
-        super().__init__('OBNC')
         self.m = m
 
     def calculate_margins(self, X, y, bagging:BaggingClassifier):
@@ -70,6 +78,9 @@ class OrderingBasedCorrection(LabelCorrectionModel):
         y_corrected.loc[index] = y_pred.loc[index]
 
         return y_corrected
+    
+    def log_params(self):
+        mlflow.log_param('correction_alg', 'Ordering-Based Correction')
 
 class FairOBNCRemoveSensitive(OrderingBasedCorrection):
     """
@@ -98,6 +109,11 @@ class FairOBNCRemoveSensitive(OrderingBasedCorrection):
         y_corrected.loc[index] = y_pred.loc[index]
 
         return y_corrected
+    
+    def log_params(self):
+        mlflow.log_param('correction_alg', self.name)
+        mlflow.log_param('m', self.m)
+        mlflow.log_param('sensitive_attr', self.sensitive_attr)
 
 class FairOBNCOptimizeDemographicParity(OrderingBasedCorrection):
     """
@@ -109,42 +125,19 @@ class FairOBNCOptimizeDemographicParity(OrderingBasedCorrection):
         Proportion of labels to correct
     sensitive_attr : str
         Name of sensitive attribute
+    prob : float
+        Probability of correcting a label that does not contribute to balancing label distribution across sensitive groups
     """
-    def __init__(self, m:float, sensitive_attr:str):
+    def __init__(self, m:float, sensitive_attr:str, prob:float):
         super().__init__('Fair-OBNC-dp', m)
         self.sensitive_attr = sensitive_attr
+        self.prob = prob
 
     def dem_par_diff(self, X, y, attr):
         p_y1_g1 = len(y.loc[(X[attr] == 1) & (y == 1)]) / len(y.loc[X[attr] == 1])
         p_y1_g0 = len(y.loc[(X[attr] == 0) & (y == 1)]) / len(y.loc[X[attr] == 0])
 
         return p_y1_g1 - p_y1_g0
-    
-    def correct_dem_par(self, X, y, y_pred, margins):
-        y_corrected = y.copy()
-
-        n = int(self.m*len(margins))
-        corrected = 0
-
-        for i in margins.index:
-            dem_par = self.dem_par_diff(X, y, self.sensitive_attr)
-            if dem_par == 0:
-                y_corrected.loc[i] = y_pred.loc[i]
-                corrected += 1
-            else:
-                if X.loc[i, self.sensitive_attr] == 0:
-                    if y.loc[i] == int(dem_par < 0):
-                        y_corrected.loc[i] = y_pred.loc[i]
-                        corrected += 1
-                else:
-                    if y.loc[i] == int(dem_par > 0):
-                        y_corrected.loc[i] =  y_pred.loc[i]
-                        corrected += 1
-            
-            if corrected == n:
-                break
-
-        return y_corrected
 
     def correct(self, X:pd.DataFrame, y:pd.Series):
         y_corrected = y.copy()
@@ -154,9 +147,34 @@ class FairOBNCOptimizeDemographicParity(OrderingBasedCorrection):
 
         margins = self.calculate_margins(X.loc[y != y_pred], y.loc[y != y_pred], bagging).apply(lambda x: abs(x)).sort_values(ascending=False)
 
-        y_corrected = self.correct_dem_par(X, y, y_pred, margins)
+        dem_par = self.dem_par_diff(X, y, self.sensitive_attr)
+        n = int(self.m*len(margins))
+
+        if dem_par == 0:
+            y_corrected.loc[margins.index[:n]] = [(1 - y.loc[i]) for i in margins.index[:n]]
+
+        else:
+            corrected = 0
+            for i in margins.index:
+                if X.loc[i, self.sensitive_attr] == 0:
+                    if y.loc[i] == int(dem_par < 0) or np.random.random() < self.prob:
+                        y_corrected.loc[i] = y_pred.loc[i]
+                        corrected += 1
+                else:
+                    if y.loc[i] == int(dem_par > 0) or np.random.random() < self.prob:
+                        y_corrected.loc[i] =  y_pred.loc[i]
+                        corrected += 1
+                
+                if corrected == n:
+                    break
 
         return y_corrected
+    
+    def log_params(self):
+        mlflow.log_param('correction_alg', self.name)
+        mlflow.log_param('m', self.m)
+        mlflow.log_param('sensitive_attr', self.sensitive_attr)
+        mlflow.log_param('prob', self.prob)
 
 class FairOBNC(FairOBNCOptimizeDemographicParity):
     """
@@ -168,10 +186,11 @@ class FairOBNC(FairOBNCOptimizeDemographicParity):
         Proportion of labels to correct
     sensitive_attr : str
         Name of sensitive attribute
+    prob : float
+        Probability of correcting a label that does not contribute to balancing label distribution across sensitive groups
     """
-
-    def __init__(self, m:float, sensitive_attr:str):
-        super().__init__('Fair-OBNC', m, sensitive_attr)
+    def __init__(self, m:float, sensitive_attr:str, prob:float):
+        super().__init__('Fair-OBNC', m, sensitive_attr, prob)
 
     def correct(self, X:pd.DataFrame, y:pd.Series):
         y_corrected = y.copy()
@@ -182,6 +201,56 @@ class FairOBNC(FairOBNCOptimizeDemographicParity):
 
         margins = self.calculate_margins(X_fair.loc[y != y_pred], y.loc[y != y_pred], bagging).apply(lambda x: abs(x)).sort_values(ascending=False)
 
-        y_corrected = self.correct_dem_par(X_fair, y, y_pred, margins)
+        dem_par = self.dem_par_diff(X, y, self.sensitive_attr)
+        n = int(self.m*len(margins))
+
+        if dem_par == 0:
+            y_corrected.loc[margins.index[:n]] = [(1 - y.loc[i]) for i in margins.index[:n]]
+
+        else:
+            corrected = 0
+            for i in margins.index:
+                if X.loc[i, self.sensitive_attr] == 0:
+                    if y.loc[i] == int(dem_par < 0) or np.random.random() < self.prob:
+                        y_corrected.loc[i] = y_pred.loc[i]
+                        corrected += 1
+                else:
+                    if y.loc[i] == int(dem_par > 0) or np.random.random() < self.prob:
+                        y_corrected.loc[i] =  y_pred.loc[i]
+                        corrected += 1
+                
+                if corrected == n:
+                    break
 
         return y_corrected
+    
+    def log_params(self):
+        mlflow.log_param('correction_alg', self.name)
+        mlflow.log_param('m', self.m)
+        mlflow.log_param('sensitive_attr', self.sensitive_attr)
+        mlflow.log_param('prob', self.prob)
+
+
+def get_label_correction_model(args) -> LabelCorrectionModel:
+    """
+    Initialize the label correction model
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments containing the correction algorithm and its parameters
+
+    Returns
+    -------
+    model: LabelCorrectionModel
+        Label correction model
+    """
+
+    if args.correction_alg == 'OBNC':
+        return OrderingBasedCorrection(args.m)
+    elif args.correction_alg == 'OBNC-remove-sensitive':
+        return FairOBNCRemoveSensitive(args.m, args.sensitive_attr)
+    elif args.correction_alg == 'OBNC-optimize-demographic-parity':
+        return FairOBNCOptimizeDemographicParity(args.m, args.sensitive_attr, args.prob)
+    elif args.correction_alg == 'OBNC-fair':
+        return FairOBNC(args.m, args.sensitive_attr, args.prob)
